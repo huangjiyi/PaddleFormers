@@ -2213,6 +2213,27 @@ class Trainer:
                             logger.warning("found `no sync` param when `use_expert_parallel=False`")
                         fused_allreduce_gradients(nonmoe_list, hcg)
 
+                    def dsv4_allreduce_dense_grads_over_ep(paramlist):
+                        if os.environ.get("DSV4_FLEET_ALLREDUCE_DENSE_GRAD_OVER_EP", "0") != "1":
+                            return
+                        hcg = getattr(self.optimizer, "_hcg", None)
+                        if hcg is None or hcg.get_expert_parallel_world_size() <= 1:
+                            return
+                        ep_group = hcg.get_expert_parallel_group()
+                        ep_world_size = hcg.get_expert_parallel_world_size()
+                        with paddle.no_grad():
+                            for p in paramlist:
+                                if getattr(p, "no_sync", False):
+                                    continue
+                                grad = getattr(p, "main_grad", None)
+                                if grad is None:
+                                    grad_attr = getattr(p, "grad", None)
+                                    grad = grad_attr() if callable(grad_attr) else grad_attr
+                                if grad is None:
+                                    continue
+                                dist.all_reduce(grad, op=dist.ReduceOp.SUM, group=ep_group)
+                                grad.scale_(1.0 / ep_world_size)
+
                     def hybrid_parallel_scale_param_grad(paramlist, hcg):
                         if not hasattr(hcg, "get_context_parallel_world_size"):
                             cp_worldsize = 1
@@ -2266,6 +2287,7 @@ class Trainer:
                                 args.recompute_granularity is not None or args.use_expert_parallel
                             ) and available_no_sync:
                                 fused_allreduce_gradients_no_sync(list(model.parameters()), None)
+                                dsv4_allreduce_dense_grads_over_ep(list(model.parameters()))
 
                             # Case 2: hack dp with master_grad
                             elif dp_master_grad:

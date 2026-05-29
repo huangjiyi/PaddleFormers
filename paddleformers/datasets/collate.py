@@ -13,7 +13,9 @@
 # limitations under the License.
 
 import inspect
+import json
 import math
+import os
 from typing import List
 
 import numpy as np
@@ -477,6 +479,28 @@ def collate_fn(
     if padding_free:
         batch = [sum(batch, [])]
         max_seq_len = sum(len(item.token_ids) for sequence in batch for item in sequence)
+    fixed_tokens_path = os.environ.get("DSV4_FLEET_FIXED_TOKENS")
+    fixed_tokens = None
+    if fixed_tokens_path:
+        with open(fixed_tokens_path, "r", encoding="utf-8") as f:
+            fixed_payload = json.load(f)
+        fixed_tokens = fixed_payload["tokens"] if isinstance(fixed_payload, dict) else fixed_payload
+        fixed_tokens = [int(token) for token in fixed_tokens]
+        expected_token_count = training_args.max_seq_len + training_args.num_nextn_predict_layers
+        if len(fixed_tokens) != expected_token_count:
+            raise ValueError(
+                f"DSV4_FLEET_FIXED_TOKENS expects {expected_token_count} tokens "
+                f"for max_seq_len={training_args.max_seq_len} and "
+                f"num_nextn_predict_layers={training_args.num_nextn_predict_layers}, "
+                f"got {len(fixed_tokens)} from {fixed_tokens_path}"
+            )
+        # Use the same main LM input/label pair as Megatron:
+        # input_ids=fixed[:-1], labels=fixed[1:].
+        mtp_depth = training_args.num_nextn_predict_layers
+        fixed_input_ids = fixed_tokens[:-mtp_depth] if mtp_depth > 0 else fixed_tokens
+        fixed_labels = fixed_tokens[mtp_depth:] if mtp_depth > 0 else fixed_tokens
+        fixed_position_ids = list(range(len(fixed_input_ids)))
+        max_seq_len = calc_padding_size(len(fixed_input_ids), training_args)
     if not max_seq_len:
         max_seq_len = max(sum(len(item.token_ids) for item in sequence) for sequence in batch)
     max_seq_len = calc_padding_size(max_seq_len, training_args)
@@ -489,13 +513,19 @@ def collate_fn(
         input_keys.append("mtp_layer_mask")
 
     for batch_sequence in batch:
-        if len(batch_sequence) == 1 and isinstance(batch_sequence[0].position_ids[0], List):
+        if fixed_tokens is not None:
+            original_position_ids = [fixed_position_ids]
+            token_ids = [fixed_input_ids]
+            labels = [fixed_labels]
+            position_ids = [fixed_position_ids]
+        elif len(batch_sequence) == 1 and isinstance(batch_sequence[0].position_ids[0], List):
             original_position_ids = batch_sequence[0].position_ids
         else:
             original_position_ids = [seq.position_ids for seq in batch_sequence]
-        token_ids = [sum([seq.token_ids for seq in batch_sequence], [])]
-        labels = [sum([seq.labels for seq in batch_sequence], [])]
-        position_ids = [sum(original_position_ids, [])]
+        if fixed_tokens is None:
+            token_ids = [sum([seq.token_ids for seq in batch_sequence], [])]
+            labels = [sum([seq.labels for seq in batch_sequence], [])]
+            position_ids = [sum(original_position_ids, [])]
         # padding
         padded_token_ids = pad_batch_data(token_ids, pad_idx=tokenizer.pad_token_id, max_seq_len=max_seq_len)
         padded_labels = pad_batch_data(labels, pad_idx=-100, max_seq_len=max_seq_len)
@@ -562,6 +592,32 @@ def collate_fn(
 
     return_list = [np.concatenate(tensor_list) for tensor_list in zip(*return_list)]
     input_dict = dict(zip(input_keys, return_list))
+    if fixed_tokens is not None and (
+        os.environ.get("LOG_DATA_MD5", "0") == "1"
+        or os.environ.get("LOG_LAYER_MD5", "0") == "1"
+    ):
+        import hashlib
+
+        try:
+            rank = paddle.distributed.get_rank()
+        except Exception:
+            rank = 0
+        main_input = np.asarray([fixed_input_ids], dtype=np.int64)
+        main_labels = np.asarray([fixed_labels], dtype=np.int64)
+        print(
+            f"[DSV4_FLEET_FIXED_TOKENS] using fixed token batch from {fixed_tokens_path}",
+            flush=True,
+        )
+        print(
+            f"[DATA_PATH_MD5] rank={rank} input_ids shape={list(main_input.shape)} "
+            f"md5={hashlib.md5(main_input.tobytes()).hexdigest()}",
+            flush=True,
+        )
+        print(
+            f"[DATA_PATH_MD5] rank={rank} labels shape={list(main_labels.shape)} "
+            f"md5={hashlib.md5(main_labels.tobytes()).hexdigest()}",
+            flush=True,
+        )
     return input_dict
 
 
